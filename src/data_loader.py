@@ -205,30 +205,42 @@ def clean_schedule_data(raw_df):
     ]].sort_values(['date', 'game_number']).reset_index(drop=True)
 
 
-import os
-os.makedirs('data/raw', exist_ok=True)
-os.makedirs('data/processed', exist_ok=True)
-
 if __name__ == "__main__":
-    teams = ['ARI', 'ATL', 'BAL', 'BOS', 'CHC', 'CHW', 'CIN', 'CLE', 'COL',
-             'DET', 'HOU', 'KCR', 'LAA', 'LAD', 'MIA', 'MIL', 'MIN', 'NYM',
-             'NYY', 'ATH', 'PHI', 'PIT', 'SDP', 'SEA', 'SFG', 'STL', 'TBR',
-             'TEX', 'TOR', 'WSN'] # 'ATH' is 'OAK' for 2021-2025 seasons, 'ATH' for 2026 season
-    seasons = [2021, 2022, 2023, 2024, 2025, 2026]
+    import os
+    os.makedirs('data/raw', exist_ok=True)
+    os.makedirs('data/processed', exist_ok=True)
 
     all_cleaned = []
+    already_pulled_seasons = [2021, 2022, 2023, 2024]
 
-    for season in seasons:
-        raw = pull_schedule_data(teams, [season])
+    # Reuse cached raw pulls for completed seasons — no need to hit
+    # Baseball-Reference again, and the NaN fix doesn't change anything
+    # for seasons where every game already has a real score.
+    for season in already_pulled_seasons:
+        raw = pd.read_parquet(f'data/raw/schedule_raw_{season}.parquet')
         cleaned = clean_schedule_data(raw)
         all_cleaned.append(cleaned)
-
-        # Checkpoint after every season — if something crashes on season 5,
-        # you don't lose the first 4 seasons of work
-        raw.to_parquet(f'data/raw/schedule_raw_{season}.parquet')
         cleaned.to_parquet(f'data/raw/schedule_cleaned_{season}.parquet')
+        print(f"Re-cleaned cached {season}: {len(cleaned)} games")
 
-        print(f"\n=== Season {season} complete: {len(cleaned)} games ===\n")
+    # Fresh pull for 2025 and 2026 — the Athletics moved to Sacramento and
+    # dropped the "OAK" abbreviation starting with the 2025 season. The old
+    # OAK schedule URL still returns 200 for 2025, but it serves a stale
+    # pre-season "preview" snapshot (no scores) instead of real results, so
+    # any cached 2025 pull done under "OAK" is silently wrong and needs to
+    # be redone under "ATH".
+    teams_current = ['ARI', 'ATL', 'BAL', 'BOS', 'CHC', 'CHW', 'CIN', 'CLE', 'COL',
+                      'DET', 'HOU', 'KCR', 'LAA', 'LAD', 'MIA', 'MIL', 'MIN', 'NYM',
+                      'NYY', 'ATH', 'PHI', 'PIT', 'SDP', 'SEA', 'SFG', 'STL', 'TBR',
+                      'TEX', 'TOR', 'WSN']
+
+    for season in [2025, 2026]:
+        raw_season = pull_schedule_data(teams_current, [season])
+        cleaned_season = clean_schedule_data(raw_season)
+        all_cleaned.append(cleaned_season)
+        raw_season.to_parquet(f'data/raw/schedule_raw_{season}.parquet')
+        cleaned_season.to_parquet(f'data/raw/schedule_cleaned_{season}.parquet')
+        print(f"Season {season} complete: {len(cleaned_season)} games")
 
     master_schedule = pd.concat(all_cleaned, ignore_index=True)
     master_schedule.to_parquet('data/processed/master_schedule.parquet')
