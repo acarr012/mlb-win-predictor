@@ -160,6 +160,15 @@ def clean_schedule_data(raw_df):
         'RA': 'away_score',
     })
 
+    # Drop games that haven't been played yet (future 2026 schedule, etc.)
+    # Must happen BEFORE any score comparison — NaN comparisons don't behave
+    # the way you'd expect (NaN != NaN evaluates True), so relying on the
+    # tie-filter below to catch these would silently mislabel unplayed
+    # games as home losses instead of dropping them.
+    home_rows['home_score'] = pd.to_numeric(home_rows['home_score'], errors='coerce')
+    home_rows['away_score'] = pd.to_numeric(home_rows['away_score'], errors='coerce')
+    home_rows = home_rows.dropna(subset=['home_score', 'away_score'])
+
     # Doubleheader games are suffixed "Aug 7 (1)" / "Aug 7 (2)" on
     # Baseball-Reference. Both games share the same calendar date, so we
     # pull the "(1)"/"(2)" marker into its own column BEFORE parsing the
@@ -196,19 +205,33 @@ def clean_schedule_data(raw_df):
     ]].sort_values(['date', 'game_number']).reset_index(drop=True)
 
 
+import os
+os.makedirs('data/raw', exist_ok=True)
+os.makedirs('data/processed', exist_ok=True)
+
 if __name__ == "__main__":
-    test_teams = ['NYY', 'BOS']
-    test_seasons = [2024]
+    teams = ['ARI', 'ATL', 'BAL', 'BOS', 'CHC', 'CHW', 'CIN', 'CLE', 'COL',
+             'DET', 'HOU', 'KCR', 'LAA', 'LAD', 'MIA', 'MIL', 'MIN', 'NYM',
+             'NYY', 'ATH', 'PHI', 'PIT', 'SDP', 'SEA', 'SFG', 'STL', 'TBR',
+             'TEX', 'TOR', 'WSN'] # 'ATH' is 'OAK' for 2021-2025 seasons, 'ATH' for 2026 season
+    seasons = [2021, 2022, 2023, 2024, 2025, 2026]
 
-    raw = pull_schedule_data(test_teams, test_seasons)
+    all_cleaned = []
 
-    print("\n--- Home_Away column raw values ---")
-    print(raw['Home_Away'].unique())
+    for season in seasons:
+        raw = pull_schedule_data(teams, [season])
+        cleaned = clean_schedule_data(raw)
+        all_cleaned.append(cleaned)
 
-    cleaned = clean_schedule_data(raw)
+        # Checkpoint after every season — if something crashes on season 5,
+        # you don't lose the first 4 seasons of work
+        raw.to_parquet(f'data/raw/schedule_raw_{season}.parquet')
+        cleaned.to_parquet(f'data/raw/schedule_cleaned_{season}.parquet')
 
-    print("\n--- Cleaned game table ---")
-    print(cleaned.head(10))
-    print(f"\nTotal games: {len(cleaned)}")
-    print(f"Raw rows before dedup: {len(raw)}")
+        print(f"\n=== Season {season} complete: {len(cleaned)} games ===\n")
 
+    master_schedule = pd.concat(all_cleaned, ignore_index=True)
+    master_schedule.to_parquet('data/processed/master_schedule.parquet')
+
+    print(f"\nTotal games across all seasons: {len(master_schedule)}")
+    print(master_schedule.groupby('season').size())
