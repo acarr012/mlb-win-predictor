@@ -247,3 +247,83 @@ if __name__ == "__main__":
 
     print(f"\nTotal games across all seasons: {len(master_schedule)}")
     print(master_schedule.groupby('season').size())
+
+
+from pybaseball import statcast
+
+
+def pull_statcast_range(start_dt, end_dt):
+    """
+    Pulls pitch-level Statcast data for a given date range.
+
+    Statcast has no team parameter — every pitch from every MLB game
+    in the range comes back in one call. Keep date ranges small
+    (weekly/monthly) to avoid request timeouts/truncation on large pulls.
+
+    Parameters
+    ----------
+    start_dt, end_dt : str
+        Dates in 'YYYY-MM-DD' format
+
+    Returns
+    -------
+    pd.DataFrame
+        Pitch-level Statcast data
+    """
+    df = statcast(start_dt=start_dt, end_dt=end_dt)
+    print(f"Pulled {len(df)} pitches from {start_dt} to {end_dt}")
+    return df
+
+
+if __name__ == "__main__":
+    # Prototype: opening week 2024, overlaps with already-verified schedule data
+    sample = pull_statcast_range('2024-03-28', '2024-04-03')
+    print(sample.columns.tolist())
+    print(sample[['game_date', 'game_pk', 'home_team', 'away_team',
+                   'inning', 'inning_topbot', 'pitcher']].head(10))
+    
+
+def identify_starting_pitchers(statcast_df):
+    """
+    Identifies the home and away starting pitcher for each game from
+    pitch-level Statcast data.
+
+    The home team pitches in the top of the 1st inning (away team bats
+    first); the away team pitches in the bottom of the 1st.
+
+    Statcast rows are NOT guaranteed to be in chronological/game order.
+    We explicitly sort by (game_pk, at_bat_number, pitch_number) — the
+    true in-game sequence — before taking the first pitcher, so this
+    stays correct even if a pitching change happens mid-first-inning
+    (early injury, blowup start, etc.), not just in the common case.
+
+    Parameters
+    ----------
+    statcast_df : pd.DataFrame
+        Output of pull_statcast_range()
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per game_pk with home_starter_id and away_starter_id
+    """
+    first_inning = statcast_df[statcast_df['inning'] == 1].sort_values(
+        ['game_pk', 'at_bat_number', 'pitch_number']
+    )
+
+    home_starters = (
+        first_inning[first_inning['inning_topbot'] == 'Top']
+        .groupby('game_pk')['pitcher']
+        .first()
+        .rename('home_starter_id')
+    )
+
+    away_starters = (
+        first_inning[first_inning['inning_topbot'] == 'Bot']
+        .groupby('game_pk')['pitcher']
+        .first()
+        .rename('away_starter_id')
+    )
+
+    starters = pd.concat([home_starters, away_starters], axis=1).reset_index()
+    return starters
