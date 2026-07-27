@@ -6,6 +6,8 @@ Derives predictive features from cleaned raw data:
 - Rolling team and pitcher statistics (to be added)
 """
 
+import glob
+
 import pandas as pd
 import os
 from data_loader import pull_statcast_season, clean_statcast_data, identify_starting_pitchers
@@ -155,37 +157,6 @@ def add_rolling_pitcher_stats(game_log, window=None):
     return game_log
 
 
-
-if __name__ == "__main__":
-    os.makedirs('data/processed', exist_ok=True)
-
-    seasons = [2021, 2022, 2023, 2024, 2025, 2026]
-    all_game_logs = []
-
-    for season in seasons:
-        raw_statcast = pull_statcast_season(season)
-        regular_season = clean_statcast_data(raw_statcast)
-
-        game_log = build_pitcher_game_log(regular_season)
-        game_log = add_rolling_pitcher_stats(game_log, window=None)  # season-to-date
-        game_log = add_rolling_pitcher_stats(game_log, window=3)     # last 3 starts
-        game_log = add_rolling_pitcher_stats(game_log, window=5)     # last 5 starts
-
-        game_log.to_parquet(f'data/processed/pitcher_game_log_{season}.parquet')
-        all_game_logs.append(game_log)
-
-        print(f"Season {season}: {len(game_log)} pitcher-game rows\n")
-
-    master_pitcher_log = pd.concat(all_game_logs, ignore_index=True)
-    master_pitcher_log.to_parquet('data/processed/master_pitcher_game_log.parquet')
-
-    print(f"\nTotal pitcher-game rows across all seasons: {len(master_pitcher_log)}")
-    print(master_pitcher_log.groupby('season').size())
-
-
-
-import glob
-
 # Statcast uses different team abbreviations than Baseball-Reference
 # (schedule data) for 7 franchises. Maps Statcast's code -> the schedule
 # table's code, so downstream merges match correctly instead of silently
@@ -262,3 +233,52 @@ def build_starters_with_game_info(season):
     result['game_date'] = pd.to_datetime(result['game_date'])
 
     return result
+
+
+if __name__ == "__main__":
+    os.makedirs('data/processed', exist_ok=True)
+
+    seasons = [2021, 2022, 2023, 2024, 2025, 2026]
+    all_game_logs = []
+
+    for season in seasons:
+        raw_statcast = pull_statcast_season(season)
+        regular_season = clean_statcast_data(raw_statcast)
+
+        game_log = build_pitcher_game_log(regular_season)
+        game_log = add_rolling_pitcher_stats(game_log, window=None)  # season-to-date
+        game_log = add_rolling_pitcher_stats(game_log, window=3)     # last 3 starts
+        game_log = add_rolling_pitcher_stats(game_log, window=5)     # last 5 starts
+
+        game_log.to_parquet(f'data/processed/pitcher_game_log_{season}.parquet')
+        all_game_logs.append(game_log)
+
+        print(f"Season {season}: {len(game_log)} pitcher-game rows\n")
+
+    master_pitcher_log = pd.concat(all_game_logs, ignore_index=True)
+    master_pitcher_log.to_parquet('data/processed/master_pitcher_game_log.parquet')
+
+    print(f"\nTotal pitcher-game rows across all seasons: {len(master_pitcher_log)}")
+    print(master_pitcher_log.groupby('season').size())
+
+    all_starters = []
+    for season in seasons:
+        starters = build_starters_with_game_info(season)
+        all_starters.append(starters)
+
+    master_starters = pd.concat(all_starters, ignore_index=True)
+
+    master_schedule = pd.read_parquet('data/processed/master_schedule.parquet')
+
+    master_game_table = master_schedule.merge(
+        master_starters,
+        left_on=['date', 'game_number', 'home_team', 'away_team'],
+        right_on=['game_date', 'game_number', 'home_team', 'away_team'],
+        how='left'
+    )
+
+    print(f"Schedule games: {len(master_schedule)}")
+    print(f"Matched: {master_game_table['home_starter_id'].notna().sum()}")
+    print(f"Unmatched: {master_game_table['home_starter_id'].isna().sum()}")
+
+    master_game_table.to_parquet('data/processed/master_game_table.parquet')
