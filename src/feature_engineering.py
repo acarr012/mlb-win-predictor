@@ -90,6 +90,64 @@ def build_pitcher_game_log(statcast_df):
         strikeouts=('is_strikeout', 'sum'),
         hit_by_pitch=('is_hbp', 'sum'),
         game_date=('game_date', 'first'),
+        season=('game_year', 'first'),
     ).reset_index()
+
+    return game_log
+
+
+
+def add_rolling_pitcher_stats(game_log, window=None):
+    """
+    Computes rolling pre-game WHIP and FIP for each pitcher, using only
+    starts strictly before the current game (shift(1), same leakage
+    discipline as the team-level rolling features).
+
+    Parameters
+    ----------
+    game_log : pd.DataFrame
+        Output of build_pitcher_game_log(), with a 'season' column
+        already attached (merge this in before calling, if not present)
+    window : int or None
+        Number of most recent starts to include. None = cumulative,
+        season-to-date (all starts so far this season). An integer
+        (e.g. 3) = rolling window over just the last N starts.
+
+    Returns
+    -------
+    pd.DataFrame
+        game_log with two new columns added: whip_entering_game and
+        fip_entering_game (column names include the window size if given)
+    """
+    game_log = game_log.sort_values(['pitcher', 'season', 'game_date']).copy()
+    grouped = game_log.groupby(['pitcher', 'season'])
+
+    if window is None:
+        outs = grouped['outs_recorded'].transform(lambda x: x.shift(1).expanding().sum())
+        hits = grouped['hits_allowed'].transform(lambda x: x.shift(1).expanding().sum())
+        walks = grouped['walks_allowed'].transform(lambda x: x.shift(1).expanding().sum())
+        hr = grouped['home_runs_allowed'].transform(lambda x: x.shift(1).expanding().sum())
+        k = grouped['strikeouts'].transform(lambda x: x.shift(1).expanding().sum())
+        hbp = grouped['hit_by_pitch'].transform(lambda x: x.shift(1).expanding().sum())
+        suffix = 'season'
+    else:
+        outs = grouped['outs_recorded'].transform(lambda x: x.shift(1).rolling(window).sum())
+        hits = grouped['hits_allowed'].transform(lambda x: x.shift(1).rolling(window).sum())
+        walks = grouped['walks_allowed'].transform(lambda x: x.shift(1).rolling(window).sum())
+        hr = grouped['home_runs_allowed'].transform(lambda x: x.shift(1).rolling(window).sum())
+        k = grouped['strikeouts'].transform(lambda x: x.shift(1).rolling(window).sum())
+        hbp = grouped['hit_by_pitch'].transform(lambda x: x.shift(1).rolling(window).sum())
+        suffix = f'last{window}'
+
+    innings_pitched = outs / 3
+
+    game_log[f'whip_entering_game_{suffix}'] = (walks + hits) / innings_pitched
+
+    # FIP formula: standard constant (~3.10, varies slightly by year/league)
+    # added so FIP sits on the same numeric scale as ERA for interpretability
+    fip_constant = 3.10
+    game_log[f'fip_entering_game_{suffix}'] = (
+        (13 * hr + 3 * (walks + hbp) - 2 * k) / innings_pitched
+    ) + fip_constant
 
     return game_log
