@@ -8,7 +8,7 @@ Derives predictive features from cleaned raw data:
 
 import pandas as pd
 import os
-from data_loader import pull_statcast_season, clean_statcast_data
+from data_loader import pull_statcast_season, clean_statcast_data, identify_starting_pitchers
 
 # Maps each Statcast `events` value to how many outs that specific play
 # recorded. This is the foundation for innings pitched (outs / 3), which
@@ -181,3 +181,84 @@ if __name__ == "__main__":
 
     print(f"\nTotal pitcher-game rows across all seasons: {len(master_pitcher_log)}")
     print(master_pitcher_log.groupby('season').size())
+
+
+
+import glob
+
+# Statcast uses different team abbreviations than Baseball-Reference
+# (schedule data) for 7 franchises. Maps Statcast's code -> the schedule
+# table's code, so downstream merges match correctly instead of silently
+# dropping ~a quarter of a season's games.
+STATCAST_TO_SCHEDULE_ABBR = {
+    'AZ': 'ARI',
+    'CWS': 'CHW',
+    'KC': 'KCR',
+    'SD': 'SDP',
+    'SF': 'SFG',
+    'TB': 'TBR',
+    'WSH': 'WSN',
+}
+
+# The Athletics are a special case: Statcast always reports them as "ATH",
+# but the schedule table's abbreviation depends on the season it was
+# pulled in. Seasons 2021-2024 were cached under Baseball-Reference's old
+# "OAK" abbreviation (correct at the time); 2025+ was pulled fresh under
+# "ATH" after the franchise's move/rename. So this one mapping flips
+# depending on which season we're building.
+ATHLETICS_RENAME_SEASON = 2025
+
+
+def build_starters_with_game_info(season):
+    """
+    Reloads cached raw Statcast monthly files for a season, filters to
+    regular season, identifies starters, and attaches each game's date
+    and teams (needed to merge against the schedule table later, which
+    has no game_pk of its own).
+
+    Team abbreviations are normalized to match the schedule table's
+    convention here, at the source — so every downstream use of this
+    function's output is automatically safe, rather than relying on
+    whoever calls it to remember to apply the crosswalk separately.
+    """
+    monthly_files = glob.glob(f'data/raw/statcast_{season}_*.parquet')
+    raw = pd.concat([pd.read_parquet(f) for f in monthly_files], ignore_index=True)
+    regular_season = clean_statcast_data(raw)
+
+    starters = identify_starting_pitchers(regular_season)
+
+    game_info = regular_season.groupby('game_pk').agg(
+        game_date=('game_date', 'first'),
+        home_team=('home_team', 'first'),
+        away_team=('away_team', 'first'),
+    ).reset_index()
+
+    result = starters.merge(game_info, on='game_pk')
+
+    abbr_map = dict(STATCAST_TO_SCHEDULE_ABBR)
+    if season < ATHLETICS_RENAME_SEASON:
+        abbr_map['ATH'] = 'OAK'
+
+    result['home_team'] = result['home_team'].replace(abbr_map)
+    result['away_team'] = result['away_team'].replace(abbr_map)
+
+    # Doubleheader games share the same (date, home_team, away_team), so
+    # without a tiebreaker a merge against the schedule table's
+    # game_number column would match each schedule row against BOTH
+    # games instead of just its own — silently doubling and cross-wiring
+    # starter assignments for every doubleheader date. game_pk is
+    # assigned in play order, so ranking within the group recovers which
+    # game was 1 and which was 2.
+    result['game_number'] = (
+        result.groupby(['home_team', 'away_team', 'game_date'])['game_pk']
+        .rank(method='first')
+        .astype(int)
+    )
+
+    # Statcast's game_date comes through as a plain string; the schedule
+    # table's date column is datetime64. Normalize here so merges against
+    # the schedule table work out of the box instead of raising a dtype
+    # ValueError on every caller.
+    result['game_date'] = pd.to_datetime(result['game_date'])
+
+    return result
