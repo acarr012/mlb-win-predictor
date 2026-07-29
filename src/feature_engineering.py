@@ -54,6 +54,65 @@ HIT_EVENTS = {'single', 'double', 'triple', 'home_run'}
 # still put a runner on base, so they count same as a regular walk)
 WALK_EVENTS = {'walk', 'intent_walk'}
 
+def build_team_rolling_stats(master_schedule):
+    """
+    Computes rolling pre-game team stats: win %, run differential, and
+    runs scored per game — cumulative season-to-date, using only games
+    strictly before the current one (same shift(1) discipline as pitcher
+    rolling stats).
+
+    master_schedule has one row per GAME (home team's perspective only),
+    but rolling stats need one row per TEAM per game — a team's rolling
+    win% has to reflect its record from BOTH home and away games. So we
+    first reshape into a long, one-row-per-team-per-game table before
+    computing anything.
+
+    Parameters
+    ----------
+    master_schedule : pd.DataFrame
+        Output of clean_schedule_data() / master_schedule.parquet
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per (team, game_date, season), with rolling win_pct,
+        run_diff, and runs_per_game entering that game
+    """
+    home_side = master_schedule[[
+        'date', 'game_number', 'season', 'home_team', 'home_score', 'away_score', 'home_team_won'
+    ]].rename(columns={
+        'home_team': 'team', 'home_score': 'runs_scored',
+        'away_score': 'runs_allowed', 'home_team_won': 'won'
+    })
+
+    away_side = master_schedule[[
+        'date', 'game_number', 'season', 'away_team', 'home_score', 'away_score', 'home_team_won'
+    ]].rename(columns={
+        'away_team': 'team', 'away_score': 'runs_scored',
+        'home_score': 'runs_allowed'
+    })
+    away_side['won'] = 1 - away_side['home_team_won']
+    away_side = away_side.drop(columns='home_team_won')
+
+    team_log = pd.concat([home_side, away_side], ignore_index=True)
+    team_log = team_log.sort_values(['team', 'season', 'date', 'game_number'])
+
+    grouped = team_log.groupby(['team', 'season'])
+
+    team_log['win_pct_entering'] = grouped['won'].transform(
+        lambda x: x.shift(1).expanding().mean()
+    )
+    team_log['run_diff_entering'] = grouped.apply(
+        lambda g: (g['runs_scored'] - g['runs_allowed']).shift(1).expanding().mean()
+    ).reset_index(level=[0, 1], drop=True)
+    team_log['runs_per_game_entering'] = grouped['runs_scored'].transform(
+        lambda x: x.shift(1).expanding().mean()
+    )
+
+    return team_log[[
+        'team', 'date', 'game_number', 'season',
+        'win_pct_entering', 'run_diff_entering', 'runs_per_game_entering'
+    ]]
 
 def build_pitcher_game_log(statcast_df):
     """
@@ -235,6 +294,66 @@ def build_starters_with_game_info(season):
     return result
 
 
+def build_master_feature_table():
+    """
+    Assembles the final modeling table: schedule + starters (already
+    merged in master_game_table.parquet) + team rolling stats (home and
+    away) + starting pitcher rolling stats (home and away).
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per game, fully feature-complete
+    """
+    game_table = pd.read_parquet('data/processed/master_game_table.parquet')
+    master_schedule = pd.read_parquet('data/processed/master_schedule.parquet')
+    pitcher_log = pd.read_parquet('data/processed/master_pitcher_game_log.parquet')
+
+    team_rolling = build_team_rolling_stats(master_schedule)
+
+    # Merge team rolling stats for the HOME team
+    home_team_stats = team_rolling.rename(columns={
+        'team': 'home_team',
+        'win_pct_entering': 'home_win_pct_entering',
+        'run_diff_entering': 'home_run_diff_entering',
+        'runs_per_game_entering': 'home_runs_per_game_entering',
+    })
+    game_table = game_table.merge(
+        home_team_stats,
+        on=['home_team', 'date', 'game_number', 'season'],
+        how='left'
+    )
+
+    # Merge team rolling stats for the AWAY team
+    away_team_stats = team_rolling.rename(columns={
+        'team': 'away_team',
+        'win_pct_entering': 'away_win_pct_entering',
+        'run_diff_entering': 'away_run_diff_entering',
+        'runs_per_game_entering': 'away_runs_per_game_entering',
+    })
+    game_table = game_table.merge(
+        away_team_stats,
+        on=['away_team', 'date', 'game_number', 'season'],
+        how='left'
+    )
+
+    # Merge pitcher rolling stats for the HOME starter
+    pitcher_cols = [c for c in pitcher_log.columns if 'entering_game' in c]
+    home_pitcher_stats = pitcher_log[['game_pk', 'pitcher'] + pitcher_cols].rename(
+        columns={'pitcher': 'home_starter_id',
+                 **{c: f'home_starter_{c}' for c in pitcher_cols}}
+    )
+    game_table = game_table.merge(home_pitcher_stats, on=['game_pk', 'home_starter_id'], how='left')
+
+    # Merge pitcher rolling stats for the AWAY starter
+    away_pitcher_stats = pitcher_log[['game_pk', 'pitcher'] + pitcher_cols].rename(
+        columns={'pitcher': 'away_starter_id',
+                 **{c: f'away_starter_{c}' for c in pitcher_cols}}
+    )
+    game_table = game_table.merge(away_pitcher_stats, on=['game_pk', 'away_starter_id'], how='left')
+
+    return game_table
+
 if __name__ == "__main__":
     os.makedirs('data/processed', exist_ok=True)
 
@@ -282,3 +401,8 @@ if __name__ == "__main__":
     print(f"Unmatched: {master_game_table['home_starter_id'].isna().sum()}")
 
     master_game_table.to_parquet('data/processed/master_game_table.parquet')
+
+    final_table = build_master_feature_table()
+    final_table.to_parquet('data/processed/master_feature_table.parquet')
+    print(f"\nFinal feature table: {final_table.shape}")
+    print(final_table.columns.tolist())
